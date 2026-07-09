@@ -1,0 +1,141 @@
+name: CI
+
+# Ported from the GitLab pipeline (.gitlab-ci.yml + ci/android.yml + ci/ios.yml).
+# Runs on pull requests and on main, and can be started manually (workflow_dispatch).
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Security scans (replaces the GitLab SAST stage + MobSF jobs) ──────────────
+  # Enforcing: any finding fails the job (verified secrets, HIGH/CRITICAL vulns,
+  # ERROR-severity SAST rules, or mobsfscan findings), gating the pipeline.
+  sast:
+    name: Security scans
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: TruffleHog (secret scan)
+        # Download the installer to a file before running it — piping curl straight into a
+        # shell is flagged by SAST (gha-curl-pipe-shell) and executes unverified remote code.
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+            -o "$RUNNER_TEMP/trufflehog-install.sh"
+          sh "$RUNNER_TEMP/trufflehog-install.sh" -b "$RUNNER_TEMP/bin"
+          "$RUNNER_TEMP/bin/trufflehog" filesystem . --only-verified --fail
+
+      - name: Trivy (vuln / secret / misconfig)
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            -o "$RUNNER_TEMP/trivy-install.sh"
+          sh "$RUNNER_TEMP/trivy-install.sh" -b "$RUNNER_TEMP/bin"
+          "$RUNNER_TEMP/bin/trivy" fs --scanners vuln,secret,misconfig \
+            --severity HIGH,CRITICAL --exit-code 1 .
+
+      # mobsfscan shells out to the `semgrep` binary, so semgrep must be installed and on PATH
+      # (pipx run's ephemeral env doesn't persist it). Install both up front.
+      - name: Install SAST tooling (Semgrep + mobsfscan)
+        run: |
+          pipx install semgrep
+          pipx install mobsfscan
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Semgrep (SAST)
+        run: semgrep scan --config auto --severity ERROR --error .
+
+      - name: MobSF source scan (mobsfscan)
+        run: mobsfscan .
+
+  # ── Android: quality + JVM tests + AAR (replaces ci/android.yml) ──────────────
+  android:
+    name: Android build & test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gears
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android SDK packages
+        # compileSdk 36 + the pinned build-tools must be present before Gradle configures.
+        run: yes | sdkmanager "platforms;android-36" "build-tools;36.0.0" > /dev/null
+
+      - name: Quality (ktlint + detekt)
+        run: ./gradlew ktlintCheck detekt --stacktrace --console=plain
+
+      - name: Unit tests (JVM)
+        # Compose-resources desktop touches AWT (getScreenResolution) and throws
+        # HeadlessException on CI — run under a virtual framebuffer.
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb
+          xvfb-run ./gradlew jvmTest --stacktrace --console=plain
+
+      - name: Assemble Android library (AAR)
+        # Android-only assembly — must not invoke Kotlin/Native tasks.
+        run: ./gradlew assembleAndroidMain --stacktrace --console=plain
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-reports
+          path: |
+            gears/**/build/reports/
+            gears/**/build/test-results/
+
+      - name: Upload AARs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-aar
+          path: gears/**/build/outputs/aar/*.aar
+
+  # ── iOS: simulator (arm64) debug XCFramework + native tests. Runs on every PR.
+  ios:
+    name: iOS build & test
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: gears
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android SDK packages
+        # The XCFramework build configures the KMP `android` target, which needs the SDK.
+        run: yes | sdkmanager "platforms;android-36" "build-tools;36.0.0" > /dev/null
+
+      - name: Build XCFramework (debug, arm64 simulator only)
+        # -PxcfTarget=iosSimulatorArm64 builds the simulator slice only (no device).
+        run: ./gradlew :gears:assembleGearsDebugXCFramework -PxcfTarget=iosSimulatorArm64 --stacktrace --console=plain
+
+      - name: iOS unit tests (Kotlin/Native)
+        run: ./gradlew iosSimulatorArm64Test --stacktrace --console=plain
+
+      - name: Upload XCFramework
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gears-xcframework-debug
+          path: gears/gears/build/XCFrameworks/debug/Gears.xcframework
